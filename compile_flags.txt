@@ -1,0 +1,4 @@
+-std=c++17
+-I/usr/include/opencv4
+-Ihw1/include
+-Ihw2/include
