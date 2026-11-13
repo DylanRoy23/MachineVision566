@@ -1,0 +1,28 @@
+{
+  "images": "data/images",
+  "measurements": "data/measurements.csv",
+  "output": "output",
+  "datasets": {
+    "full": 1,
+    "half": 2,
+    "quarter": 4
+  },
+  "reconstruction": {
+    "colmap": "colmap",
+    "options": {
+      "feature_extractor": {
+        "ImageReader.camera_model": "SIMPLE_RADIAL",
+        "ImageReader.single_camera": true
+      },
+      "exhaustive_matcher": {},
+      "mapper": {},
+      "image_undistorter": {},
+      "patch_match_stereo": {
+        "PatchMatchStereo.geom_consistency": true
+      },
+      "stereo_fusion": {
+        "input_type": "geometric"
+      }
+    }
+  }
+}

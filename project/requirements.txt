@@ -1,0 +1,3 @@
+# Python scripts use the standard library only.
+# Video extraction: FFmpeg (installed separately).
+# Reconstruction backend: COLMAP built with CUDA (installed separately).
