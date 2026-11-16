@@ -15,12 +15,6 @@ result and must be reported, including its failure stage. A mesh or a whole-hous
 model is optional future work. Interior reconstruction, roof capture, SLAM,
 NeRFs, Gaussian splatting, and a custom viewer are outside this project's scope.
 
-Use COLMAP as the reconstruction backend. The student's contribution is the
-capture design, reproducible dataset preparation, physical validation, controlled
-experiment, and interpretation of the geometry and failures. This scope assumes
-the instructor permits an existing reconstruction backend; it is a proposal, not
-confirmation of instructor approval.
-
 ## One controlled experiment
 
 Capture one ordered sequence of approximately 120–160 sharp photos. Use one
