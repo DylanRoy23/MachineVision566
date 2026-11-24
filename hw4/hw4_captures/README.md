@@ -1,0 +1,1 @@
+The images in 'aruco_caps' are sequentially 3 inches apart

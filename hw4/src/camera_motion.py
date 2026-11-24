@@ -1,9 +1,14 @@
 """HW4 entry point. Run with --help for capture instructions and options."""
+import sys
+from pathlib import Path
+
 import cv2
 
-from utils.cli import parse_args
-from utils.markers import create_marker
-from utils.motion import motion
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from hw4.src.utils.cli import parse_args
+from hw4.src.utils.markers import create_marker
+from hw4.src.utils.motion import motion
 
 
 def main():

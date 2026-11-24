@@ -1,12 +1,9 @@
-"""Marker generation and image output."""
+"""ArUco marker generation."""
 import cv2
 
+from utils.media import save_image
+
 DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-
-
-def save_image(path, image):
-    if not cv2.imwrite(str(path), image):
-        raise ValueError(f'Could not save {path}')
 
 
 def create_marker(args, output):

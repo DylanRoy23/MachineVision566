@@ -4,9 +4,42 @@ import json
 import cv2
 import numpy as np
 
-from .geometry import point_quality, position_std, project, triangulate
+from utils.geometry import camera_center, from_homogeneous, project_points
+
+from .geometry import point_quality, position_std, triangulate
 
 IDENTITY = np.column_stack((np.eye(3), np.zeros(3)))
+
+
+def pair_geometry(tracks, K, index):
+    ids = np.flatnonzero(np.isfinite(tracks[[0, index]]).all(axis=(0, 2)))
+    if len(ids) < 8:
+        return None
+    a, b = tracks[0, ids], tracks[index, ids]
+    E, mask = cv2.findEssentialMat(
+        a, b, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
+    )
+    if E is None or E.shape != (3, 3):
+        return None
+    _, R, t, mask = cv2.recoverPose(E, a, b, K, mask=mask)
+    second = np.column_stack((R, t))
+    good = ids[mask.ravel() != 0]
+    if len(good) < 8:
+        return None
+    homogeneous = cv2.triangulatePoints(
+        K @ IDENTITY, K @ second, tracks[0, good].T, tracks[index, good].T
+    ).T.astype(float)
+    finite = np.abs(homogeneous[:, 3]) >= 1e-10
+    good = good[finite]
+    xyz = from_homogeneous(homogeneous[finite])
+    center = camera_center(R, t.ravel())
+    rays = xyz - center
+    cosine = np.sum(xyz * rays, axis=1) / (
+        np.linalg.norm(xyz, axis=1) * np.linalg.norm(rays, axis=1)
+    )
+    angles = np.degrees(np.arccos(np.clip(cosine, -1, 1)))
+    positive = (xyz[:, 2] > 0) & ((xyz @ R.T + t.ravel())[:, 2] > 0)
+    return second, good[positive], xyz[positive], angles[positive], len(ids)
 
 
 def initialize_pair(tracks, K, requested):
@@ -26,50 +59,31 @@ def initialize_pair(tracks, K, requested):
             motion = np.median(
                 np.linalg.norm(tracks[index, ids] - tracks[0, ids], axis=1)
             )
-            candidates.append((float(motion), int(index), ids))
-    for motion, index, ids in sorted(
+            candidates.append((float(motion), int(index)))
+    for motion, index in sorted(
         candidates, key=lambda item: item[0], reverse=True
     ):
-        a, b = tracks[0, ids], tracks[index, ids]
-        E, mask = cv2.findEssentialMat(
-            a, b, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
-        )
-        if E is None or E.shape != (3, 3):
+        pair = pair_geometry(tracks, K, index)
+        if pair is None:
             continue
-        _, R, t, mask = cv2.recoverPose(E, a, b, K, mask=mask)
-        second = np.column_stack((R, t))
-        good = ids[mask.ravel() != 0]
-        if len(good) < 8:
-            continue
-        homogeneous = cv2.triangulatePoints(
-            K @ IDENTITY, K @ second, tracks[0, good].T, tracks[index, good].T
-        )
+        second, good, points, angles, shared = pair
         cloud = {}
-        angles = []
-        center = -R.T @ t.ravel()
-        for point_id, point in zip(good, homogeneous.T):
-            if abs(point[3]) < 1e-10:
-                continue
-            xyz = point[:3] / point[3]
-            ray_a, ray_b = xyz, xyz - center
-            cosine = np.dot(ray_a, ray_b) / (
-                np.linalg.norm(ray_a) * np.linalg.norm(ray_b)
-            )
-            angle = float(np.degrees(np.arccos(np.clip(cosine, -1, 1))))
+        kept_angles = []
+        for point_id, xyz, angle in zip(good, points, angles):
             valid, _ = point_quality(
                 xyz, [IDENTITY, second], tracks[[0, index], point_id], K
             )
             if valid and angle > 1.0:
                 cloud[int(point_id)] = xyz
-                angles.append(angle)
+                kept_angles.append(angle)
         if len(cloud) >= 8:
             info = dict(
                 first_frame=0,
                 second_frame=index,
-                shared_tracks=len(ids),
+                shared_tracks=shared,
                 reconstructed_points=len(cloud),
                 median_motion_px=motion,
-                median_triangulation_angle_deg=float(np.median(angles)),
+                median_triangulation_angle_deg=float(np.median(kept_angles)),
                 selection=(
                     "Largest tested median track motion passing cheirality, "
                     "3px reprojection, and >1 degree triangulation checks"
@@ -122,7 +136,7 @@ def reconstruct_video(tracks, K, poses, initial):
             if not np.isfinite(observed_pixel).all():
                 continue
 
-            predicted_pixel = project(K @ poses[frame_index], seed)
+            predicted_pixel = project_points(seed, K @ poses[frame_index])
             error_pixels = np.linalg.norm(predicted_pixel - observed_pixel)
             if error_pixels <= 3.0:
                 indices.append(frame_index)
@@ -183,25 +197,7 @@ def reconstruct(tracks, K, args):
         )
     video_cloud, views = reconstruct_video(tracks, K, poses, pair_cloud)
     save_cloud("whole_video", video_cloud, views, tracks, poses, K, args)
-    with (args.output / "comparison.csv").open("w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "point_id",
-                "two_view_x",
-                "two_view_y",
-                "two_view_z",
-                "video_x",
-                "video_y",
-                "video_z",
-                "position_difference",
-            ]
-        )
-        for point_id, xyz in sorted(video_cloud.items()):
-            initial = pair_cloud[point_id]
-            writer.writerow(
-                [point_id, *initial, *xyz, np.linalg.norm(xyz - initial)]
-            )
+    save_comparison(pair_cloud, video_cloud, args.output)
     (args.output / "results.json").write_text(json.dumps(info, indent=2) + "\n")
     print(
         f"Two-view frames: 0 and {info['second_frame']}; "
@@ -215,3 +211,26 @@ def reconstruct(tracks, K, args):
         f"Saved tracking, point clouds, and comparison to {args.output}. "
         "Coordinates have arbitrary scale."
     )
+
+
+def save_comparison(pair_cloud, video_cloud, output):
+    with (output / "comparison.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "point_id",
+                "two_view_x",
+                "two_view_y",
+                "two_view_z",
+                "video_x",
+                "video_y",
+                "video_z",
+                "position_difference",
+            ]
+        )
+        for point_id in sorted(pair_cloud.keys() & video_cloud.keys()):
+            xyz = video_cloud[point_id]
+            initial = pair_cloud[point_id]
+            writer.writerow(
+                [point_id, *initial, *xyz, np.linalg.norm(xyz - initial)]
+            )

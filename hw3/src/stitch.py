@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from utils.geometry import project_points, root_mean_square, to_homogeneous
+from utils.media import PHOTO_SUFFIXES, image_paths, read_image, resize_to_fit, save_image
+
 
 def project(points, homography):
     points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    homogeneous = np.column_stack((points, np.ones(len(points)))) @ homography.T
-    if np.any(np.abs(homogeneous[:, 2]) < 1e-10):
-        raise ValueError('Homography projects points to infinity.')
-    return homogeneous[:, :2] / homogeneous[:, 2:]
+    return project_points(points, homography, min_scale=1e-10)
 
 
 def corners(image):
@@ -43,7 +46,7 @@ def estimate_pair(source, target, ratio=0.75, threshold=3.0):
         'keypoints_source': len(ks), 'keypoints_target': len(kt),
         'ratio_matches': len(good), 'inliers': int(inliers.sum()),
         'inlier_fraction': float(inliers.mean()),
-        'inlier_rmse_px': float(np.sqrt(np.mean(errors[inliers] ** 2))),
+        'inlier_rmse_px': root_mean_square(errors[inliers]),
         'inlier_median_error_px': float(np.median(errors[inliers])),
         'point_checks': [dict(source=ps[i].tolist(), observed_target=pt[i].tolist(),
                               projected_target=project(ps[i:i+1], H)[0].tolist(),
@@ -59,7 +62,7 @@ def canvas_geometry(images, transforms, max_pixels):
     all_corners = []
     for image, H in zip(images, transforms):
         c = corners(image)
-        denominator = np.column_stack((c, np.ones(4))) @ H[2, :]
+        denominator = to_homogeneous(c) @ H[2, :]
         if np.min(denominator) <= 0 <= np.max(denominator):
             raise ValueError('A projected image crosses infinity; check matches and capture geometry.')
         all_corners.append(project(c, H))
@@ -94,20 +97,10 @@ def inverse_warp(image, H, size):
     return warped, valid
 
 
-def save_image(path, image):
-    if not cv2.imwrite(str(path), image):
-        raise OSError(f'Could not write {path}')
-
-
 def stitch(paths, output, args):
     images = []
     for path in paths:
-        image = cv2.imread(str(path))
-        if image is None:
-            raise ValueError(f'Cannot read image: {path}')
-        if max(image.shape[:2]) > 1600:
-            scale = 1600 / max(image.shape[:2])
-            image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        image, _ = resize_to_fit(read_image(path), 1600)
         images.append(image)
     output.mkdir(parents=True, exist_ok=True)
     cv2.setRNGSeed(42)
@@ -157,7 +150,7 @@ def main():
     parser.add_argument('--extra-credit', action='store_true', help='Require at least ten images instead of four')
     args = parser.parse_args()
     directory = Path(args.input)
-    paths = sorted(p for p in directory.glob('*') if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'})
+    paths = image_paths(directory, suffixes=PHOTO_SUFFIXES | {'.tif', '.tiff', '.bmp'})
     required = 10 if args.extra_credit else 4
     if len(paths) < required:
         parser.error(f'Need at least {required} images in {directory}; found {len(paths)}. Add photos with ordered filenames (01.jpg, 02.jpg, ...).')

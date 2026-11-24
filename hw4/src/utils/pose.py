@@ -2,6 +2,8 @@
 import cv2
 import numpy as np
 
+from utils.geometry import camera_center, root_mean_square
+
 
 def marker_points(side):
     s = side / 2
@@ -14,7 +16,7 @@ def pose(points, pixels, K, distortion):
     if not ok or not np.all(np.isfinite(tvec)) or tvec[2, 0] <= 0:
         raise ValueError('No valid marker pose.')
     R = cv2.Rodrigues(rvec)[0]
-    return rvec, tvec, R, (-R.T @ tvec).ravel()
+    return rvec, tvec, R, camera_center(R, tvec)
 
 
 def displacement(reference, current):
@@ -27,7 +29,7 @@ def displacement(reference, current):
 
 def reprojection_error(points, pixels, estimate, K, distortion):
     projected = cv2.projectPoints(points, estimate[0], estimate[1], K, distortion)[0]
-    return float(np.sqrt(np.mean(np.sum((projected.reshape(4, 2) - pixels) ** 2, axis=1))))
+    return root_mean_square(projected.reshape(4, 2) - pixels, vector_axis=1)
 
 
 def pose_uncertainty(points, initial_pixels, pixels, K, distortion, sigma, rng):

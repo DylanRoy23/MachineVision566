@@ -1,10 +1,18 @@
 """Track one fixed marker and save camera-motion measurements."""
 import csv
+from itertools import chain
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .markers import DICTIONARY, save_image
+from utils.calibration import camera_parameters, check_calibration_size
+from utils.media import (
+    frame_size, image_paths, open_video, open_video_writer, read_image, save_image, video_frames,
+)
+
+from .cli import PHOTO_STEP_CM
+from .markers import DICTIONARY
 from .pose import displacement, pose_uncertainty, marker_points, pose, reprojection_error
 
 COLUMNS = ['frame', 'camera_x_m', 'camera_y_m', 'camera_z_m',
@@ -16,9 +24,9 @@ COLUMNS = ['frame', 'camera_x_m', 'camera_y_m', 'camera_z_m',
 class MarkerTracker:
     def __init__(self, args):
         self.args = args
-        fx, fy, cx, cy = args.intrinsics
-        self.K = np.array([[fx, 0., cx], [0., fy, cy], [0., 0., 1.]])
-        self.distortion = np.asarray(args.distortion, dtype=float)
+        self.K, self.distortion, self.image_size = camera_parameters(
+            args.calibration, args.intrinsics, args.distortion, flags=cv2.CALIB_FIX_K3,
+        )
         parameters = cv2.aruco.DetectorParameters()
         parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.detector = cv2.aruco.ArucoDetector(DICTIONARY, parameters)
@@ -30,6 +38,7 @@ class MarkerTracker:
 
     def process(self, frame, index):
         """Draw detections and return a CSV row, or None when no pose is valid."""
+        check_calibration_size(frame_size(frame), self.image_size)
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         if ids is None:
             return None
@@ -65,59 +74,80 @@ def annotate(frame, row):
         message = f'Motion: {distance * 100:.1f} cm | rotation: {angle:.1f} deg | error: {error:.2f} px'
         if distance >= .30:
             message += ' | >= 30 cm'
-    cv2.putText(frame, message, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 255), 1)
-
-
-def open_video_writer(capture, output, size):
-    fps = capture.get(cv2.CAP_PROP_FPS)
-    fps = fps if np.isfinite(fps) and fps > 0 else 30.
-    video = cv2.VideoWriter(str(output / 'annotated.mp4'),
-                            cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
-    if not video.isOpened():
-        video.release()
-        raise ValueError('Cannot create annotated video.')
-    return video
+    scale = max(1., frame.shape[1] / 800)
+    cv2.putText(frame, message, (round(10 * scale), round(30 * scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, .55 * scale, (0, 255, 255), round(scale))
 
 
 def process_video(capture, tracker, output):
-    video = None
-    try:
-        with (output / 'motion.csv').open('w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(COLUMNS)
-            index = 0
-            while True:
-                success, frame = capture.read()
-                if not success:
-                    break
-                if video is None:
-                    video = open_video_writer(capture, output, frame.shape[1::-1])
+    with (output / 'motion.csv').open('w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(COLUMNS)
+        frames = video_frames(capture)
+        first = next(frames, None)
+        if first is None:
+            return
+        with open_video_writer(output / 'annotated.mp4', capture, frame_size(first)) as video:
+            for index, frame in enumerate(chain((first,), frames)):
                 row = tracker.process(frame, index)
                 annotate(frame, row)
                 video.write(frame)
                 if row is not None:
                     writer.writerow(row)
                     save_image(output / 'final_frame.jpg', frame)
-                index += 1
-    finally:
-        if video is not None:
-            video.release()
+
+
+def process_images(source, tracker, output, step_cm):
+    paths = image_paths(source)
+    if not paths:
+        raise ValueError(f'No JPEG or PNG images in {source}')
+    annotated = output / 'annotated_frames'
+    annotated.mkdir(exist_ok=True)
+    reference_index = None
+    expected_cm = None
+    final_frame = None
+    with (output / 'motion.csv').open('w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([*COLUMNS, 'image', 'expected_displacement_cm', 'displacement_error_cm'])
+        for index, path in enumerate(paths):
+            frame = read_image(path)
+            row = tracker.process(frame, index)
+            annotate(frame, row)
+            save_image(annotated / path.name, frame)
+            if row is not None:
+                if reference_index is None:
+                    reference_index = index
+                error_cm = None
+                if step_cm is not None:
+                    expected_cm = (index - reference_index) * step_cm
+                    error_cm = row[7] * 100 - expected_cm
+                writer.writerow([*row, path.name, expected_cm, error_cm])
+                final_frame = frame
+    if final_frame is not None:
+        save_image(output / 'final_frame.jpg', final_frame)
+    return expected_cm
 
 
 def motion(args, output):
     tracker = MarkerTracker(args)
-    source = int(args.source) if args.source.isdecimal() else args.source
-    capture = cv2.VideoCapture(source)
-    try:
-        if not capture.isOpened():
-            raise ValueError(f'Cannot open camera/video: {args.source}')
-        process_video(capture, tracker, output)
-    finally:
-        capture.release()
+    source_path = Path(args.source)
+    expected_cm = None
+    if source_path.is_dir() or args.bundled_photos:
+        step_cm = PHOTO_STEP_CM if args.bundled_photos else None
+        expected_cm = process_images(source_path, tracker, output, step_cm)
+        saved = 'CSV and annotated photos'
+    else:
+        source = int(args.source) if args.source.isdecimal() else args.source
+        with open_video(source) as capture:
+            process_video(capture, tracker, output)
+        saved = 'CSV, annotated video, and frames'
     if tracker.last_distance is None:
         raise ValueError('No valid target-marker poses were found.')
     measured_cm = tracker.last_distance * 100
+    print(f'Marker black-square side used: {args.marker_size * 100:.2f} cm')
     print(f'Final valid displacement: {measured_cm:.2f} cm')
     if args.expected_cm is not None:
-        print(f'Ruler displacement: {args.expected_cm:.2f} cm; signed error: {measured_cm - args.expected_cm:.2f} cm')
-    print(f'Saved CSV, annotated video, and frames to {output}')
+        expected_cm = args.expected_cm
+    if expected_cm is not None:
+        print(f'Ruler displacement: {expected_cm:.2f} cm; signed error: {measured_cm - expected_cm:.2f} cm')
+    print(f'Saved {saved} to {output}')
