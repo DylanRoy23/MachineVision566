@@ -10,9 +10,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from utils.geometry import project_points, root_mean_square, to_homogeneous
-from utils.media import PHOTO_SUFFIXES, image_paths, read_image, resize_to_fit, save_image
+from utils.media import open_video, resize_to_fit, save_image, video_frames
 
 MAX_OVERLAP = 0.8   # assignment limit for any two neighbouring photos
+FRAME_STEP = 3      # test every third video frame when picking frames
+ROTATIONS = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
 
 
 def project(points, homography):
@@ -31,6 +33,63 @@ def overlap_fraction(source, target, H):
     frame = corners(target).astype(np.float32)
     area, _ = cv2.intersectConvexConvex(projected, frame)
     return float(area / cv2.contourArea(frame))
+
+
+def frame_homography(a, b, detector):
+    """Homography mapping frame a into frame b (both small greyscale images), or None."""
+    ka, da = detector.detectAndCompute(a, None)
+    kb, db = detector.detectAndCompute(b, None)
+    if da is None or db is None or len(da) < 8 or len(db) < 8:
+        return None
+    good = [m for m, n in (p for p in cv2.BFMatcher(cv2.NORM_L2).knnMatch(da, db, k=2) if len(p) == 2)
+            if m.distance < 0.75 * n.distance]
+    if len(good) < 12:
+        return None
+    pa = np.float64([ka[m.queryIdx].pt for m in good])
+    pb = np.float64([kb[m.trainIdx].pt for m in good])
+    H, mask = cv2.findHomography(pa, pb, cv2.RANSAC, 3.0)
+    return H if H is not None and mask.sum() >= 12 else None
+
+
+def frames_from_video(video, output, target, rotate=0):
+    """Keep a frame each time its overlap with the last kept frame falls to the target.
+
+    Frames are compared at 640 px. If matching fails before the target is reached,
+    the last frame that still matched is kept instead, so the sequence stays connected.
+    Kept frames are saved as numbered JPEGs in <output>/frames and returned with their names.
+    """
+    directory = output / 'frames'
+    directory.mkdir(parents=True, exist_ok=True)
+    for old in directory.glob('*.jpg'):
+        old.unlink()
+    detector = cv2.SIFT_create(nfeatures=1500)
+    kept = []
+    last_small = candidate = None
+    with open_video(video) as capture:
+        for index, frame in enumerate(video_frames(capture)):
+            if index % FRAME_STEP:
+                continue
+            if rotate:
+                frame = cv2.rotate(frame, ROTATIONS[rotate])
+            small = cv2.cvtColor(resize_to_fit(frame, 640)[0], cv2.COLOR_BGR2GRAY)
+            if last_small is None:
+                kept.append(frame)
+                last_small = small
+                continue
+            H = frame_homography(small, last_small, detector)
+            overlap = overlap_fraction(small, last_small, H) if H is not None else None
+            if overlap is not None and overlap > target:
+                candidate = (frame, small)
+                continue
+            if overlap is None and candidate is not None:
+                frame, small = candidate     # matching lost: keep the last frame that matched
+            kept.append(frame)
+            last_small, candidate = small, None
+    names = [f'{number:02d}.jpg' for number in range(1, len(kept) + 1)]
+    for name, frame in zip(names, kept):
+        save_image(directory / name, frame)
+    print(f'Kept {len(kept)} frames from {video.name} at about {target:.0%} overlap; saved to {directory}')
+    return kept, names
 
 
 def estimate_pair(source, target, ratio=0.75, threshold=3.0):
@@ -107,12 +166,8 @@ def inverse_warp(image, H, size):
     return warped, valid
 
 
-def stitch(paths, output, args):
-    images = []
-    for path in paths:
-        image, _ = resize_to_fit(read_image(path), 1600)
-        images.append(image)
-    output.mkdir(parents=True, exist_ok=True)
+def stitch(frames, names, output, args):
+    images = [resize_to_fit(frame, 1600)[0] for frame in frames]
     cv2.setRNGSeed(42)
     # Each adjacent matrix maps image i+1 into image i.
     chain = [np.eye(3)]
@@ -121,9 +176,9 @@ def stitch(paths, output, args):
         H, report, drawing = estimate_pair(images[i+1], images[i])
         chain.append(chain[-1] @ H)
         overlap = overlap_fraction(images[i+1], images[i], H)
-        report.update(source=paths[i+1].name, target=paths[i].name, overlap_fraction=overlap)
+        report.update(source=names[i+1], target=names[i], overlap_fraction=overlap)
         flag = '' if overlap <= MAX_OVERLAP else f'  (above the {MAX_OVERLAP:.0%} limit)'
-        print(f'{paths[i+1].name} -> {paths[i].name}: {report["inliers"]} inliers, '
+        print(f'{names[i+1]} -> {names[i]}: {report["inliers"]} inliers, '
               f'{report["inlier_rmse_px"]:.2f} px RMSE, {overlap:.0%} overlap{flag}')
         pairs.append(report)
         save_image(output / f'matches_{i+1:02d}_to_{i:02d}.jpg', drawing)
@@ -134,7 +189,7 @@ def stitch(paths, output, args):
     total = np.zeros((size[1], size[0], 3), np.float32)
     weights = np.zeros((size[1], size[0]), np.float32)
     image_reports = []
-    for i, (path, image, H) in enumerate(zip(paths, images, transforms)):
+    for i, (name, image, H) in enumerate(zip(names, images, transforms)):
         canvas_H = translation @ H
         warped, mask = inverse_warp(image, canvas_H, size)
         save_image(output / f'warped_{i:02d}.png', warped)
@@ -143,7 +198,7 @@ def stitch(paths, output, args):
         weight = cv2.distanceTransform(padded, cv2.DIST_L2, 3)[1:-1, 1:-1]
         total += warped.astype(np.float32) * weight[:, :, None]
         weights += weight
-        image_reports.append(dict(file=str(path), processed_shape=list(image.shape),
+        image_reports.append(dict(file=name, processed_shape=list(image.shape),
                                   homography_to_reference=H.tolist(),
                                   homography_to_canvas=canvas_H.tolist(),
                                   projected_corners=project(corners(image), canvas_H).tolist()))
@@ -158,18 +213,24 @@ def stitch(paths, output, args):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--input', default=str(root / 'images' / 'main'), help='Directory of ordered photos')
-    parser.add_argument('--output', default=str(root / 'output' / 'main'))
-    parser.add_argument('--extra-credit', action='store_true', help='Require at least ten images instead of four')
+    parser = argparse.ArgumentParser(description='Build a panorama from a video of a slow pan.')
+    parser.add_argument('--input', default=str(root / 'videos' / 'house.mp4'), help='Video of a slow pan')
+    parser.add_argument('--output', default=str(root / 'output' / 'house'))
+    parser.add_argument('--frame-overlap', type=float, default=0.7,
+                        help='Overlap between kept frames (default: %(default)s)')
+    parser.add_argument('--rotate', type=int, choices=[0, 90, 180, 270], default=270,
+                        help='Rotate frames clockwise by this many degrees; the bundled video is stored '
+                             'sideways (default: %(default)s)')
     args = parser.parse_args()
-    directory = Path(args.input)
-    paths = image_paths(directory, suffixes=PHOTO_SUFFIXES | {'.tif', '.tiff', '.bmp'})
-    required = 10 if args.extra_credit else 4
-    if len(paths) < required:
-        parser.error(f'Need at least {required} images in {directory}; found {len(paths)}. Add photos with ordered filenames (01.jpg, 02.jpg, ...).')
+    if not 0 < args.frame_overlap < MAX_OVERLAP:
+        parser.error(f'--frame-overlap must be between 0 and {MAX_OVERLAP}.')
+    output = Path(args.output)
     try:
-        stitch(paths, Path(args.output), args)
+        frames, names = frames_from_video(Path(args.input), output, args.frame_overlap, args.rotate)
+        if len(frames) < 4:
+            parser.error(f'Need at least 4 frames; kept {len(frames)}. '
+                         'Pan farther, or raise --frame-overlap to keep more frames.')
+        stitch(frames, names, output, args)
     except (ValueError, OSError, cv2.error, np.linalg.LinAlgError) as error:
         parser.exit(1, f'Stitching failed: {error}\n')
 
