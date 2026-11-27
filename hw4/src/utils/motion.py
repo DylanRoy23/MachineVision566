@@ -1,24 +1,23 @@
 """Track one fixed marker and save camera-motion measurements."""
 import csv
-from itertools import chain
-from pathlib import Path
 
 import cv2
 import numpy as np
 
 from utils.calibration import camera_parameters, check_calibration_size
-from utils.media import (
-    frame_size, image_paths, open_video, open_video_writer, read_image, save_image, video_frames,
-)
+from utils.media import frame_size, image_paths, read_image, save_image
 
-from .cli import PHOTO_STEP_CM
 from .markers import DICTIONARY
-from .pose import displacement, pose_uncertainty, marker_points, pose, reprojection_error
+from .pose import (displacement, fixed_orientation_displacement, marker_points, pose,
+                   pose_uncertainty, reprojection_error)
 
 COLUMNS = ['frame', 'camera_x_m', 'camera_y_m', 'camera_z_m',
            'dx_m', 'dy_m', 'dz_m', 'displacement_m', 'rotation_deg',
-           'reprojection_rmse_px', 'dx_std_m', 'dy_std_m', 'dz_std_m',
-           'rotation_x_std_deg', 'rotation_y_std_deg', 'rotation_z_std_deg', 'distance_std_m']
+           'reprojection_rmse_px', 'fixed_orientation_displacement_m',
+           'dx_std_m', 'dy_std_m', 'dz_std_m',
+           'rotation_x_std_deg', 'rotation_y_std_deg', 'rotation_z_std_deg', 'distance_std_m',
+           'fixed_orientation_distance_std_m']
+DISTANCE, FIXED_DISTANCE = COLUMNS.index('displacement_m'), COLUMNS.index('fixed_orientation_displacement_m')
 
 
 class MarkerTracker:
@@ -34,6 +33,7 @@ class MarkerTracker:
         self.reference = None
         self.reference_pixels = None
         self.last_distance = None
+        self.last_fixed_distance = None
         self.rng = np.random.default_rng(42)
 
     def process(self, frame, index):
@@ -58,43 +58,28 @@ class MarkerTracker:
             self.reference_pixels = pixels.copy()
             save_image(self.args.output / 'initial_frame.jpg', frame)
         delta, distance, angle = displacement(self.reference, current)
+        fixed_distance = fixed_orientation_displacement(self.reference, current)
         error = reprojection_error(self.points, pixels, current, self.K, self.distortion)
-        std = [0.] * 7 if first and self.args.extra_credit else [''] * 7
+        std = [0.] * 8 if first and self.args.extra_credit else [''] * 8
         if self.args.extra_credit and not first:
             std = pose_uncertainty(self.points, self.reference_pixels, pixels,
                                    self.K, self.distortion, self.args.corner_sigma, self.rng)
         self.last_distance = distance
-        return [index, *current[3], *delta, distance, angle, error, *std]
+        self.last_fixed_distance = fixed_distance
+        return [index, *current[3], *delta, distance, angle, error, fixed_distance, *std]
 
 
 def annotate(frame, row):
     message = 'No valid target-marker pose'
     if row is not None:
-        distance, angle, error = row[7:10]
-        message = f'Motion: {distance * 100:.1f} cm | rotation: {angle:.1f} deg | error: {error:.2f} px'
-        if distance >= .30:
+        distance, angle, error = row[DISTANCE:DISTANCE + 3]
+        message = (f'Motion: {distance * 100:.1f} cm (fixed orientation {row[FIXED_DISTANCE] * 100:.1f} cm)'
+                   f' | rotation: {angle:.1f} deg | error: {error:.2f} px')
+        if row[FIXED_DISTANCE] >= .30:
             message += ' | >= 30 cm'
     scale = max(1., frame.shape[1] / 800)
     cv2.putText(frame, message, (round(10 * scale), round(30 * scale)),
                 cv2.FONT_HERSHEY_SIMPLEX, .55 * scale, (0, 255, 255), round(scale))
-
-
-def process_video(capture, tracker, output):
-    with (output / 'motion.csv').open('w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(COLUMNS)
-        frames = video_frames(capture)
-        first = next(frames, None)
-        if first is None:
-            return
-        with open_video_writer(output / 'annotated.mp4', capture, frame_size(first)) as video:
-            for index, frame in enumerate(chain((first,), frames)):
-                row = tracker.process(frame, index)
-                annotate(frame, row)
-                video.write(frame)
-                if row is not None:
-                    writer.writerow(row)
-                    save_image(output / 'final_frame.jpg', frame)
 
 
 def process_images(source, tracker, output, step_cm):
@@ -108,7 +93,8 @@ def process_images(source, tracker, output, step_cm):
     final_frame = None
     with (output / 'motion.csv').open('w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow([*COLUMNS, 'image', 'expected_displacement_cm', 'displacement_error_cm'])
+        writer.writerow([*COLUMNS, 'image', 'expected_displacement_cm', 'displacement_error_cm',
+                         'fixed_orientation_error_cm'])
         for index, path in enumerate(paths):
             frame = read_image(path)
             row = tracker.process(frame, index)
@@ -117,11 +103,10 @@ def process_images(source, tracker, output, step_cm):
             if row is not None:
                 if reference_index is None:
                     reference_index = index
-                error_cm = None
-                if step_cm is not None:
-                    expected_cm = (index - reference_index) * step_cm
-                    error_cm = row[7] * 100 - expected_cm
-                writer.writerow([*row, path.name, expected_cm, error_cm])
+                expected_cm = (index - reference_index) * step_cm
+                error_cm = row[DISTANCE] * 100 - expected_cm
+                fixed_error_cm = row[FIXED_DISTANCE] * 100 - expected_cm
+                writer.writerow([*row, path.name, expected_cm, error_cm, fixed_error_cm])
                 final_frame = frame
     if final_frame is not None:
         save_image(output / 'final_frame.jpg', final_frame)
@@ -130,24 +115,14 @@ def process_images(source, tracker, output, step_cm):
 
 def motion(args, output):
     tracker = MarkerTracker(args)
-    source_path = Path(args.source)
-    expected_cm = None
-    if source_path.is_dir() or args.bundled_photos:
-        step_cm = PHOTO_STEP_CM if args.bundled_photos else None
-        expected_cm = process_images(source_path, tracker, output, step_cm)
-        saved = 'CSV and annotated photos'
-    else:
-        source = int(args.source) if args.source.isdecimal() else args.source
-        with open_video(source) as capture:
-            process_video(capture, tracker, output)
-        saved = 'CSV, annotated video, and frames'
+    expected_cm = process_images(args.source, tracker, output, args.step_cm)
     if tracker.last_distance is None:
         raise ValueError('No valid target-marker poses were found.')
     measured_cm = tracker.last_distance * 100
+    fixed_cm = tracker.last_fixed_distance * 100
     print(f'Marker black-square side used: {args.marker_size * 100:.2f} cm')
-    print(f'Final valid displacement: {measured_cm:.2f} cm')
-    if args.expected_cm is not None:
-        expected_cm = args.expected_cm
-    if expected_cm is not None:
-        print(f'Ruler displacement: {expected_cm:.2f} cm; signed error: {measured_cm - expected_cm:.2f} cm')
-    print(f'Saved {saved} to {output}')
+    print(f'Final valid displacement: {measured_cm:.2f} cm from the full 6-DoF pose, '
+          f'{fixed_cm:.2f} cm assuming a fixed camera orientation')
+    print(f'Ruler displacement: {expected_cm:.2f} cm; signed error: {measured_cm - expected_cm:.2f} cm '
+          f'(6-DoF), {fixed_cm - expected_cm:.2f} cm (fixed orientation)')
+    print(f'Saved CSV and annotated photos to {output}')

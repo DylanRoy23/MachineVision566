@@ -1,4 +1,3 @@
-"""HW5: run with --help for inputs. Reconstruction has arbitrary scale."""
 import sys
 from copy import copy
 from pathlib import Path
@@ -9,8 +8,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from hw5.src.utils.cli import BUNDLED_REGIONS, parse_args
 from hw5.src.utils.full_video import reconstruct_full_video
-from hw5.src.utils.reconstruction import reconstruct
-from hw5.src.utils.tracking import track_video
 from utils.calibration import camera_parameters
 
 
@@ -30,11 +27,7 @@ def main():
             cv2.setRNGSeed(42)
             print(f'Processing {video.name}')
             region = BUNDLED_REGIONS.get(video.resolve())
-            if region is None:
-                tracks = track_video(run, K, distortion, calibration_size, region)
-                reconstruct(tracks, K, run)
-            else:
-                reconstruct_full_video(run, K, distortion, calibration_size, region)
+            reconstruct_full_video(run, K, distortion, calibration_size, region)
     except (ValueError, OSError, cv2.error) as error:
         raise SystemExit(f'Error: {error}') from error
 

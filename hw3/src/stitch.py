@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from utils.geometry import project_points, root_mean_square, to_homogeneous
 from utils.media import PHOTO_SUFFIXES, image_paths, read_image, resize_to_fit, save_image
 
+MAX_OVERLAP = 0.8   # assignment limit for any two neighbouring photos
+
 
 def project(points, homography):
     points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
@@ -21,6 +23,14 @@ def project(points, homography):
 def corners(image):
     h, w = image.shape[:2]
     return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], float)
+
+
+def overlap_fraction(source, target, H):
+    """Share of the target image covered by the source image once mapped through H."""
+    projected = project(corners(source), H).astype(np.float32)
+    frame = corners(target).astype(np.float32)
+    area, _ = cv2.intersectConvexConvex(projected, frame)
+    return float(area / cv2.contourArea(frame))
 
 
 def estimate_pair(source, target, ratio=0.75, threshold=3.0):
@@ -110,7 +120,11 @@ def stitch(paths, output, args):
     for i in range(len(images) - 1):
         H, report, drawing = estimate_pair(images[i+1], images[i])
         chain.append(chain[-1] @ H)
-        report.update(source=paths[i+1].name, target=paths[i].name)
+        overlap = overlap_fraction(images[i+1], images[i], H)
+        report.update(source=paths[i+1].name, target=paths[i].name, overlap_fraction=overlap)
+        flag = '' if overlap <= MAX_OVERLAP else f'  (above the {MAX_OVERLAP:.0%} limit)'
+        print(f'{paths[i+1].name} -> {paths[i].name}: {report["inliers"]} inliers, '
+              f'{report["inlier_rmse_px"]:.2f} px RMSE, {overlap:.0%} overlap{flag}')
         pairs.append(report)
         save_image(output / f'matches_{i+1:02d}_to_{i:02d}.jpg', drawing)
     anchor = len(images) // 2

@@ -27,6 +27,19 @@ def displacement(reference, current):
     return delta, distance, angle
 
 
+def fixed_orientation_displacement(reference, current):
+    """Camera displacement assuming the camera translated without rotating.
+
+    The camera centre in marker coordinates is C = -R^T t. A small, distant
+    marker gives a noisy R, and the error is multiplied by the marker distance
+    |t| (1 degree at 1.9 m moves C by 3.3 cm). If the rig only translates, R is
+    the same in both frames, so C_i - C_0 = -R^T (t_i - t_0) and the distance
+    moved is |t_i - t_0|. That depends only on the marker position, which is
+    well conditioned.
+    """
+    return float(np.linalg.norm(current[1] - reference[1]))
+
+
 def reprojection_error(points, pixels, estimate, K, distortion):
     projected = cv2.projectPoints(points, estimate[0], estimate[1], K, distortion)[0]
     return root_mean_square(projected.reshape(4, 2) - pixels, vector_axis=1)
@@ -46,5 +59,6 @@ def pose_uncertainty(points, initial_pixels, pixels, K, distortion, sigma, rng):
         delta = current[3] - initial[3]
         relative_rotation = initial[2] @ current[2].T
         rotation_error = cv2.Rodrigues(relative_rotation @ nominal_rotation.T)[0].ravel()
-        samples.append([*delta, *np.degrees(rotation_error), np.linalg.norm(delta)])
-    return np.std(samples, axis=0, ddof=1).tolist() if len(samples) > 1 else [''] * 7
+        samples.append([*delta, *np.degrees(rotation_error), np.linalg.norm(delta),
+                        fixed_orientation_displacement(initial, current)])
+    return np.std(samples, axis=0, ddof=1).tolist() if len(samples) > 1 else [''] * 8

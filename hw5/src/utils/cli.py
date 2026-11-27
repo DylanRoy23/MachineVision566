@@ -1,4 +1,3 @@
-"""Only the inputs required for tracking and reconstruction."""
 import argparse
 from pathlib import Path
 
@@ -31,15 +30,17 @@ def parse_args():
     add_calibration_arguments(parser)
     parser.add_argument('--roi', type=int, nargs=4, metavar=('X', 'Y', 'WIDTH', 'HEIGHT'),
                         help='First-frame object region (required for custom videos)')
-    parser.add_argument('--pair-frame', type=int, help='Second frame index (zero-based); default chooses from track geometry')
+    parser.add_argument('--pair-frame', type=int,
+                        help='Two-view partner of frame 0 (zero-based); default chooses from track geometry')
     parser.add_argument('--output', type=Path, default=ROOT / 'output',
                         help='Output directory (one subdirectory per clip in the default run)')
     parser.add_argument('--extra-credit', action='store_true', help='Save conditional 3D position uncertainty')
-    parser.add_argument('--pixel-sigma', type=float, default=.5, help='EC: assumed 1-sigma tracking noise in pixels')
+    parser.add_argument('--pixel-sigma', type=float,
+                        help='EC: 1-sigma pixel noise (default: estimated from bundle-adjustment residuals)')
     args = parser.parse_args()
     custom_video = args.video is not None and args.video.resolve() not in BUNDLED_REGIONS
     resolve_calibration_arguments(parser, args, None if custom_video else CALIBRATION_VIDEO)
-    if args.pixel_sigma <= 0:
+    if args.pixel_sigma is not None and args.pixel_sigma <= 0:
         parser.error('Pixel noise must be positive.')
     if custom_video and args.roi is None:
         parser.error('A custom video requires --roi X Y WIDTH HEIGHT.')

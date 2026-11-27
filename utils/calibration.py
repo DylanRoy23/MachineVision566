@@ -57,11 +57,25 @@ def calibrate(source, *, flags=0):
     if len(observations) < 6:
         raise ValueError(f'Need at least six {units} showing the full '
                          f'{BOARD[0]}-by-{BOARD[1]} inner-corner checkerboard.')
-    rms, K, distortion, _, _ = cv2.calibrateCamera(
+    rms, K, distortion, rvecs, tvecs = cv2.calibrateCamera(
         [board_points] * len(observations), observations, image_size, None, None,
         flags=flags,
     )
-    print(f'Calibration: {len(observations)} {units}, {rms:.2f} px RMS reprojection error')
+    # Blurred or misdetected views have much larger residuals than the rest.
+    # Drop views above twice the median per-view RMS and calibrate again.
+    view_rms = np.array([
+        np.sqrt(np.mean(np.sum((cv2.projectPoints(board_points, r, t, K, distortion)[0] - corners) ** 2, axis=2)))
+        for r, t, corners in zip(rvecs, tvecs, observations)
+    ])
+    keep = view_rms <= 2 * np.median(view_rms)
+    dropped = ''
+    if not keep.all() and keep.sum() >= 6:
+        observations = [o for o, k in zip(observations, keep) if k]
+        rms, K, distortion, _, _ = cv2.calibrateCamera(
+            [board_points] * len(observations), observations, image_size, None, None, flags=flags,
+        )
+        dropped = f' ({(~keep).sum()} outlier {units} removed)'
+    print(f'Calibration: {len(observations)} {units}, {rms:.2f} px RMS reprojection error{dropped}')
     return K, distortion, image_size
 
 
